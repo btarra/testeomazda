@@ -56,6 +56,7 @@ MAX_PUNTOS_BLOQUE = 360
 MAX_RAM_DIA = 60000
 
 TIMEOUT_ESP32_SEGUNDOS = 6
+MUESTRAS_POR_REGIMEN = 30
 
 
 # ============================================================
@@ -147,6 +148,24 @@ COLUMNAS_SQL = [
     "temp_admision"
 ]
 
+REGIMENES_IFAC = {
+    "ralenti": {
+        "nombre": "1. Ralentí estable (~715–725 RPM, Refrigerante > 75 °C)",
+        "corto": "Ralentí estable",
+        "descripcion": "Motor en marcha mínima estable entre 715 y 725 RPM con temperatura de refrigerante superior a 75 °C."
+    },
+    "rampa": {
+        "nombre": "2. Aceleración progresiva en rampa (10 %–50 % pedal hasta ~2000 RPM)",
+        "corto": "Aceleración en rampa",
+        "descripcion": "Apertura progresiva del pedal acelerador entre 10 % y 50 % alcanzando hasta ~2000 RPM."
+    },
+    "sostenido": {
+        "nombre": "3. Régimen sostenido (~2500 RPM)",
+        "corto": "Sostenido 2500 RPM",
+        "descripcion": "Velocidad de giro sostenida alrededor de 2500 RPM (rango operativo 2450–2550 RPM)."
+    }
+}
+
 
 # ============================================================
 # 3. CONFIGURACIÓN DE STREAMLIT
@@ -178,7 +197,7 @@ st.markdown(
 
 
 # ============================================================
-# 4. UTILIDADES
+# 4. UTILIDADES Y EVALUACIÓN DE RÉGIMEN EXPERIMENTAL
 # ============================================================
 
 def obtener_ahora():
@@ -214,11 +233,6 @@ def buscar_clave(diccionario, alias):
 
 
 def obtener_timestamp(objeto):
-    """
-    Intenta utilizar la marca temporal enviada por la ESP32.
-    Si no existe o no puede interpretarse, utiliza la hora local.
-    """
-
     posibles = [
         objeto.get("timestamp"),
         objeto.get("datetime"),
@@ -248,6 +262,59 @@ def obtener_timestamp(objeto):
             continue
 
     return obtener_ahora()
+
+
+def evaluar_regimen(regimen_key, registro):
+    """
+    Evalúa si una trama cumple:
+    1) Validez simultánea de los 8 PIDs.
+    2) Condiciones físicas del régimen experimental (IFAC 2027).
+    Retorna: (todos_pids_validos, cumple_fisica, detalle_texto)
+    """
+    todos_validos = all(
+        bool(registro.get(f"{clave}_valid", False)) and registro.get(clave) is not None
+        for clave in CLAVES_PARAMETROS
+    )
+
+    if not todos_validos:
+        faltantes = [
+            PARAMETROS[k]["nombre"]
+            for k in CLAVES_PARAMETROS
+            if not (bool(registro.get(f"{k}_valid", False)) and registro.get(k) is not None)
+        ]
+        return False, False, f"PIDs incompletos ({len(faltantes)} sin dato)"
+
+    rpm = float(registro["rpm"])
+    pedal = float(registro["acelerador"])
+    temp_ref = float(registro["temp_refrigerante"])
+
+    if regimen_key == "ralenti":
+        ok_rpm = 715.0 <= rpm <= 725.0
+        ok_temp = temp_ref > 75.0
+        cumple = ok_rpm and ok_temp
+        detalle = (
+            f"RPM: {rpm:.1f} (meta 715–725) | "
+            f"Refrigerante: {temp_ref:.1f} °C (meta > 75 °C)"
+        )
+        return True, cumple, detalle
+
+    if regimen_key == "rampa":
+        ok_pedal = 10.0 <= pedal <= 50.0
+        ok_rpm = 720.0 <= rpm <= 2050.0
+        cumple = ok_pedal and ok_rpm
+        detalle = (
+            f"Pedal: {pedal:.1f} % (meta 10–50 %) | "
+            f"RPM: {rpm:.1f} (meta ≤ 2000)"
+        )
+        return True, cumple, detalle
+
+    if regimen_key == "sostenido":
+        ok_rpm = 2450.0 <= rpm <= 2550.0
+        cumple = ok_rpm
+        detalle = f"RPM: {rpm:.1f} (meta ~2500 ± 50)"
+        return True, cumple, detalle
+
+    return True, False, "Régimen desconocido"
 
 
 # ============================================================
@@ -303,7 +370,6 @@ def procesar_payload(payload):
 
         valor = convertir_numero(valor_original)
 
-        # Buscar bandera de validez en diccionario anidado o en la raíz del JSON
         validez_individual = buscar_clave(
             validez,
             configuracion["alias"]
@@ -336,15 +402,30 @@ def procesar_payload(payload):
 # 6. GENERADOR DE DATOS SIMULADOS (8 PIDS MAZDA BT-50 DIÉSEL)
 # ============================================================
 
-def generar_datos_simulados():
+def generar_datos_simulados(regimen_objetivo=None):
     """
     Genera valores ficticios dentro de los regímenes experimentales
-    de la Mazda BT-50 Diésel (~720 RPM ralentí hasta 2500 RPM).
+    de la Mazda BT-50 Diésel. Si hay una captura activa, ajusta la
+    simulación al régimen seleccionado para validar el protocolo.
     """
+    if regimen_objetivo == "ralenti":
+        rpm = random.uniform(716.0, 724.0)
+        acelerador = 0.0
+        temp_ref = random.uniform(77.0, 86.0)
+    elif regimen_objetivo == "rampa":
+        acelerador = random.uniform(12.0, 48.0)
+        rpm = 750.0 + (acelerador / 50.0) * 1250.0 + random.uniform(-20, 20)
+        temp_ref = random.uniform(78.0, 88.0)
+    elif regimen_objetivo == "sostenido":
+        rpm = random.uniform(2475.0, 2525.0)
+        acelerador = random.uniform(35.0, 46.0)
+        temp_ref = random.uniform(80.0, 91.0)
+    else:
+        rpm = random.uniform(715.0, 2550.0)
+        acelerador = max(0.0, min(55.0, (rpm - 715.0) / 35.0 + random.uniform(-2, 3)))
+        temp_ref = random.uniform(76.0, 92.0)
 
-    rpm = random.uniform(715, 2550)
-    acelerador = max(0.0, min(55.0, (rpm - 715.0) / 35.0 + random.uniform(-2, 3)))
-    carga = min(100.0, max(12.0, (rpm / 2600.0) * 75.0 + random.uniform(-5, 10)))
+    carga = min(100.0, max(12.0, (rpm / 2600.0) * 75.0 + random.uniform(-4, 6)))
 
     return {
         "Momento": obtener_ahora(),
@@ -353,7 +434,7 @@ def generar_datos_simulados():
         "reading_id": str(time.time_ns()),
         "source": "SIMULADO",
         "elm_connected": True,
-        "hz": round(random.uniform(10.0, 12.5), 2),
+        "hz": round(random.uniform(10.2, 12.4), 2),
         "ts_ms": None,
 
         "rpm": float(rpm),
@@ -361,7 +442,7 @@ def generar_datos_simulados():
         "carga_motor": float(carga),
         "map": random.uniform(98.0, 185.0),
         "maf": random.uniform(6.5, 48.0),
-        "temp_refrigerante": random.uniform(76.0, 92.0),
+        "temp_refrigerante": float(temp_ref),
         "presion_combustible": random.uniform(24000.0, 95000.0),
         "temp_admision": random.uniform(22.0, 42.0),
 
@@ -373,7 +454,7 @@ def generar_datos_simulados():
 
 
 # ============================================================
-# 7. RECOLECTOR MQTT Y BASE DE DATOS
+# 7. RECOLECTOR MQTT, BASE DE DATOS Y PROTOCOLO 90 MUESTRAS
 # ============================================================
 
 class RecolectorMQTT:
@@ -406,6 +487,17 @@ class RecolectorMQTT:
         self.ultimo_device_id = None
         self.ultimo_elm_connected = None
         self.ultimo_hz = None
+
+        # Estado de captura guiada (Protocolo 90 muestras IFAC 2027)
+        self.captura_activa = False
+        self.regimen_activo = "ralenti"
+        self.validar_condiciones_fisicas = True
+        self.conteo_regimenes = {
+            "ralenti": 0,
+            "rampa": 0,
+            "sostenido": 0
+        }
+        self.estado_captura_msg = "Listo para iniciar grabación por régimen."
 
         self.db_conn = sqlite3.connect(
             ARCHIVO_DB,
@@ -442,14 +534,41 @@ class RecolectorMQTT:
 
         definiciones.append("payload TEXT")
 
-        sql = f"""
+        sql_general = f"""
         CREATE TABLE IF NOT EXISTS obd_lecturas (
             {",".join(definiciones)}
         )
         """
 
+        # Tabla dedicada para el dataset limpio de 90 muestras (IFAC 2027)
+        def_ifac = [
+            "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "regimen TEXT NOT NULL",
+            "regimen_nombre TEXT NOT NULL",
+            "muestra_num INTEGER NOT NULL",
+            "fecha TEXT NOT NULL",
+            "hora TEXT NOT NULL",
+            "momento_iso TEXT NOT NULL",
+            "ts_ms REAL",
+            "hz REAL",
+            "reading_id TEXT",
+            "device_id TEXT",
+            "source TEXT NOT NULL"
+        ]
+
+        for clave in CLAVES_PARAMETROS:
+            def_ifac.append(f"{clave} REAL")
+            def_ifac.append(f"{clave}_valid INTEGER NOT NULL DEFAULT 0")
+
+        sql_ifac = f"""
+        CREATE TABLE IF NOT EXISTS muestras_ifac (
+            {",".join(def_ifac)}
+        )
+        """
+
         with self.lock:
-            self.db_conn.execute(sql)
+            self.db_conn.execute(sql_general)
+            self.db_conn.execute(sql_ifac)
 
             self.db_conn.execute(
                 """
@@ -495,6 +614,18 @@ class RecolectorMQTT:
                 0
             )
 
+            # Cargar conteo actual de muestras IFAC por régimen
+            cur.execute(
+                """
+                SELECT regimen, COUNT(*)
+                FROM muestras_ifac
+                GROUP BY regimen
+                """
+            )
+            for reg, cant in cur.fetchall():
+                if reg in self.conteo_regimenes:
+                    self.conteo_regimenes[reg] = int(cant)
+
             cur.execute(
                 """
                 SELECT *
@@ -533,6 +664,127 @@ class RecolectorMQTT:
                 self.historial_hoy.append(registro)
 
             self.fecha_actual = obtener_ahora().strftime("%Y-%m-%d")
+
+    def iniciar_captura_regimen(self, regimen_key, validar_fisica=True):
+        with self.lock:
+            if regimen_key not in REGIMENES_IFAC:
+                return
+            actual = self.conteo_regimenes.get(regimen_key, 0)
+            if actual >= MUESTRAS_POR_REGIMEN:
+                self.captura_activa = False
+                self.estado_captura_msg = (
+                    f"El régimen '{REGIMENES_IFAC[regimen_key]['corto']}' "
+                    f"ya tiene {MUESTRAS_POR_REGIMEN}/{MUESTRAS_POR_REGIMEN} muestras."
+                )
+                return
+
+            self.regimen_activo = regimen_key
+            self.validar_condiciones_fisicas = validar_fisica
+            self.captura_activa = True
+            self.estado_captura_msg = (
+                f"Grabando {REGIMENES_IFAC[regimen_key]['corto']} "
+                f"({actual}/{MUESTRAS_POR_REGIMEN})..."
+            )
+
+    def detener_captura(self):
+        with self.lock:
+            self.captura_activa = False
+            self.estado_captura_msg = "Captura pausada por el usuario."
+
+    def limpiar_regimen(self, regimen_key):
+        with self.lock:
+            self.captura_activa = False
+            self.db_conn.execute(
+                "DELETE FROM muestras_ifac WHERE regimen = ?",
+                (regimen_key,)
+            )
+            self.db_conn.commit()
+            self.conteo_regimenes[regimen_key] = 0
+            self.estado_captura_msg = (
+                f"Muestras reiniciadas para '{REGIMENES_IFAC[regimen_key]['corto']}'."
+            )
+
+    def _procesar_muestra_ifac_si_aplica(self, registro, fecha, hora):
+        """
+        Evalúa en tiempo real (dentro del lock) si la trama debe guardarse
+        en el dataset experimental de 90 muestras.
+        """
+        if not self.captura_activa:
+            return
+
+        reg = self.regimen_activo
+        actual = self.conteo_regimenes.get(reg, 0)
+
+        if actual >= MUESTRAS_POR_REGIMEN:
+            self.captura_activa = False
+            return
+
+        todos_validos, cumple_fisica, detalle = evaluar_regimen(reg, registro)
+
+        if not todos_validos:
+            self.estado_captura_msg = f"Esperando trama completa (8/8 PIDs): {detalle}"
+            return
+
+        if self.validar_condiciones_fisicas and not cumple_fisica:
+            self.estado_captura_msg = f"Fuera de ventana operativa -> {detalle}"
+            return
+
+        nuevo_num = actual + 1
+
+        columnas = [
+            "regimen",
+            "regimen_nombre",
+            "muestra_num",
+            "fecha",
+            "hora",
+            "momento_iso",
+            "ts_ms",
+            "hz",
+            "reading_id",
+            "device_id",
+            "source"
+        ]
+
+        valores = [
+            reg,
+            REGIMENES_IFAC[reg]["corto"],
+            nuevo_num,
+            fecha,
+            hora,
+            registro["Momento"].isoformat(),
+            registro.get("ts_ms"),
+            registro.get("hz"),
+            str(registro.get("reading_id", "")),
+            registro.get("device_id"),
+            registro.get("source", "REAL")
+        ]
+
+        for clave in CLAVES_PARAMETROS:
+            columnas.append(clave)
+            valores.append(registro.get(clave))
+            columnas.append(f"{clave}_valid")
+            valores.append(int(bool(registro.get(f"{clave}_valid", False))))
+
+        placeholders = ",".join(["?"] * len(columnas))
+        sql = f"""
+        INSERT INTO muestras_ifac ({",".join(columnas)})
+        VALUES ({placeholders})
+        """
+
+        self.db_conn.execute(sql, valores)
+        self.conteo_regimenes[reg] = nuevo_num
+
+        if nuevo_num >= MUESTRAS_POR_REGIMEN:
+            self.captura_activa = False
+            self.estado_captura_msg = (
+                f"✅ ¡Completado! {MUESTRAS_POR_REGIMEN}/{MUESTRAS_POR_REGIMEN} "
+                f"muestras válidas capturadas en '{REGIMENES_IFAC[reg]['corto']}'."
+            )
+        else:
+            self.estado_captura_msg = (
+                f"Grabando '{REGIMENES_IFAC[reg]['corto']}': "
+                f"{nuevo_num}/{MUESTRAS_POR_REGIMEN} muestras válidas."
+            )
 
     def guardar_registro(self, registro, payload=""):
 
@@ -594,6 +846,10 @@ class RecolectorMQTT:
             try:
 
                 self.db_conn.execute(sql, valores)
+
+                # Evaluar también si corresponde al protocolo de 90 muestras
+                self._procesar_muestra_ifac_si_aplica(registro, fecha, hora)
+
                 self.db_conn.commit()
 
                 registro["Fecha"] = fecha
@@ -620,6 +876,31 @@ class RecolectorMQTT:
 
             except Exception as e:
                 self.mqtt_error = f"Error SQLite: {e}"
+
+    def obtener_muestras_ifac(self):
+        with self.lock:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                """
+                SELECT *
+                FROM muestras_ifac
+                ORDER BY
+                    CASE regimen
+                        WHEN 'ralenti' THEN 1
+                        WHEN 'rampa' THEN 2
+                        WHEN 'sostenido' THEN 3
+                        ELSE 4
+                    END,
+                    muestra_num ASC
+                """
+            )
+            filas = cur.fetchall()
+            nombres = [d[0] for d in cur.description]
+
+        if not filas:
+            return pd.DataFrame()
+
+        return pd.DataFrame([dict(zip(nombres, f)) for f in filas])
 
     def obtener_lecturas_fecha(self, fecha=None):
 
@@ -802,7 +1083,7 @@ recolector = obtener_recolector()
 
 
 # ============================================================
-# 8. CONSULTA HISTÓRICA
+# 8. CONSULTA HISTÓRICA Y EXPORTACIÓN CSV
 # ============================================================
 
 @st.cache_data(ttl=10)
@@ -843,6 +1124,28 @@ def exportar_csv(df):
     ).encode("utf-8-sig")
 
 
+def exportar_csv_ifac(df_ifac):
+    if df_ifac.empty:
+        return b""
+
+    columnas = [
+        "regimen",
+        "regimen_nombre",
+        "muestra_num",
+        "fecha",
+        "hora",
+        "momento_iso",
+        "ts_ms",
+        "hz",
+        "reading_id",
+        "device_id",
+        "source"
+    ] + CLAVES_PARAMETROS
+
+    columnas = [c for c in columnas if c in df_ifac.columns]
+    return df_ifac[columnas].to_csv(index=False).encode("utf-8-sig")
+
+
 # ============================================================
 # 9. ESTADO DE LA INTERFAZ
 # ============================================================
@@ -868,8 +1171,8 @@ st.markdown(
     Sistema de telemetría remota de las **8 variables dinámicas depuradas**
     del banco diésel Mazda BT-50 mediante **ESP32 + ELM327 + MQTT**.
 
-    Permite supervisar curvas en tiempo real, verificar la frecuencia de muestreo
-    y exportar registros históricos para el Gemelo Digital (Simulink/FMU).
+    Incluye control automatizado para el protocolo experimental de **90 muestras**
+    (30 por régimen) requerido para el artículo **IFAC AMEST 2027** y la co-simulación FMU.
     """
 )
 
@@ -889,7 +1192,7 @@ with col_sim:
     st.session_state.simulacion_activa = st.toggle(
         "Activar datos simulados",
         value=st.session_state.simulacion_activa,
-        help="Genera lecturas ficticias de los 8 PIDs para probar el dashboard."
+        help="Genera lecturas ficticias de los 8 PIDs para probar el dashboard y el protocolo de 90 muestras."
     )
 
 with col_info:
@@ -923,8 +1226,14 @@ def dashboard():
     # --------------------------------------------------------
 
     if st.session_state.simulacion_activa:
+        with recolector.lock:
+            reg_hint = (
+                recolector.regimen_activo
+                if recolector.captura_activa
+                else None
+            )
 
-        registro_simulado = generar_datos_simulados()
+        registro_simulado = generar_datos_simulados(reg_hint)
 
         recolector.guardar_registro(
             registro_simulado,
@@ -938,38 +1247,31 @@ def dashboard():
     with recolector.lock:
 
         mqtt_conectado = recolector.mqtt_connected
-
         mqtt_error = recolector.mqtt_error
-
         ultimo_ts = recolector.ultimo_mensaje_ts
-
         ultima_hora = recolector.ultima_hora
-
         ultimo_device_id = recolector.ultimo_device_id
-
         ultimo_elm = recolector.ultimo_elm_connected
-
         ultimo_hz = recolector.ultimo_hz
 
         ultimo_topic = recolector.ultimo_topic
-
         ultimo_payload = recolector.ultimo_payload
-
         ultimo_error_payload = recolector.ultimo_error_payload
 
         mensajes_recibidos = recolector.mensajes_recibidos
-
         mensajes_invalidos = recolector.mensajes_invalidos
-
         mensajes_reales = recolector.mensajes_reales
-
         mensajes_simulados = recolector.mensajes_simulados
 
         total_global = recolector.total_historico
-
         conteos = dict(recolector.conteo_por_fecha)
-
         lista_hoy = list(recolector.historial_hoy)
+
+        captura_activa = recolector.captura_activa
+        regimen_activo = recolector.regimen_activo
+        validar_fisica = recolector.validar_condiciones_fisicas
+        conteo_reg = dict(recolector.conteo_regimenes)
+        estado_captura_msg = recolector.estado_captura_msg
 
     conteos.setdefault(fecha_hoy, 0)
 
@@ -980,102 +1282,17 @@ def dashboard():
     # --------------------------------------------------------
 
     if ultimo_ts is not None:
-
         segundos_sin_datos = time.monotonic() - ultimo_ts
-
         esp32_conectada = (
             segundos_sin_datos <= TIMEOUT_ESP32_SEGUNDOS
         )
-
     else:
-
         segundos_sin_datos = None
         esp32_conectada = False
 
     # --------------------------------------------------------
-    # Selección de fecha
-    # --------------------------------------------------------
-
-    st.subheader("📅 Historial y selección de jornada")
-
-    if st.session_state.fecha_seleccionada not in fechas:
-        st.session_state.fecha_seleccionada = fecha_hoy
-
-    fecha_elegida = st.selectbox(
-        "Seleccionar fecha:",
-        options=fechas,
-        index=fechas.index(st.session_state.fecha_seleccionada),
-        format_func=lambda f: (
-            f"{f} — {conteos.get(f, 0):,} registros"
-        ),
-        key="fecha_obd_selector"
-    )
-
-    st.session_state.fecha_seleccionada = fecha_elegida
-
-    es_hoy = fecha_elegida == fecha_hoy
-
-    if es_hoy:
-
-        df = pd.DataFrame(lista_hoy)
-
-    else:
-
-        df = cargar_dia(
-            fecha_elegida,
-            conteos.get(fecha_elegida, 0)
-        )
-
-    total_dia = len(df)
-
-    # --------------------------------------------------------
-    # Exportación CSV
-    # --------------------------------------------------------
-
-    st.subheader("📥 Exportación de datos")
-
-    if not df.empty:
-
-        col_csv1, col_csv2 = st.columns(2)
-
-        with col_csv1:
-
-            st.download_button(
-                "📅 Descargar jornada seleccionada",
-                data=exportar_csv(df),
-                file_name=f"mazda_bt50_obd2_{fecha_elegida}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="btn_csv_jornada"
-            )
-
-        with col_csv2:
-
-            st.download_button(
-                "🌐 Descargar historial completo",
-                data=exportar_csv(
-                    recolector.obtener_lecturas_fecha(None)
-                ),
-                file_name="mazda_bt50_obd2_completo.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="btn_csv_completo"
-            )
-
-        st.caption(
-            f"Registros de la jornada: {total_dia:,} | "
-            f"Registros históricos totales: {total_global:,}"
-        )
-
-    else:
-
-        st.info("Todavía no existen registros para esta fecha.")
-
-    # --------------------------------------------------------
     # Estado de conexión
     # --------------------------------------------------------
-
-    st.divider()
 
     st.subheader("📡 Estado del sistema")
 
@@ -1111,11 +1328,198 @@ def dashboard():
         ultimo_device_id or "Sin identificar"
     )
 
-    if not es_hoy:
-        st.caption(
-            "Los estados de conexión corresponden a la recepción actual, "
-            "no a la fecha histórica seleccionada."
+    # --------------------------------------------------------
+    # PROTOCOLO EXPERIMENTAL: TOMA DE LAS 90 MUESTRAS (IFAC 2027)
+    # --------------------------------------------------------
+
+    st.divider()
+    st.subheader("🎯 Protocolo Experimental: Captura de las 90 Muestras (IFAC 2027)")
+
+    total_90 = sum(conteo_reg.values())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(
+        "1. Ralentí estable",
+        f"{conteo_reg['ralenti']} / {MUESTRAS_POR_REGIMEN}",
+        delta="715–725 RPM | Ref > 75 °C"
+    )
+    m2.metric(
+        "2. Aceleración rampa",
+        f"{conteo_reg['rampa']} / {MUESTRAS_POR_REGIMEN}",
+        delta="10–50 % pedal → ~2000 RPM"
+    )
+    m3.metric(
+        "3. Régimen sostenido",
+        f"{conteo_reg['sostenido']} / {MUESTRAS_POR_REGIMEN}",
+        delta="~2500 RPM"
+    )
+    m4.metric(
+        "Total Dataset IFAC",
+        f"{total_90} / {MUESTRAS_POR_REGIMEN * 3}",
+        delta="Listo para FMU" if total_90 >= 90 else "En progreso"
+    )
+
+    st.progress(min(1.0, total_90 / float(MUESTRAS_POR_REGIMEN * 3)))
+
+    col_reg_sel, col_reg_ctrl = st.columns([2, 2])
+
+    with col_reg_sel:
+        claves_reg = list(REGIMENES_IFAC.keys())
+        regimen_elegido = st.selectbox(
+            "Régimen operativo a grabar:",
+            options=claves_reg,
+            index=claves_reg.index(regimen_activo),
+            format_func=lambda k: REGIMENES_IFAC[k]["nombre"],
+            disabled=captura_activa,
+            key="selector_regimen_ifac"
         )
+
+        validar_check = st.checkbox(
+            "Validar automáticamente condiciones físicas (RPM, pedal % y refrigerante > 75 °C)",
+            value=validar_fisica,
+            disabled=captura_activa,
+            key="check_validar_fisica_ifac"
+        )
+
+        # Semáforo en vivo de condiciones del régimen elegido
+        if lista_hoy:
+            ultima_muestra = lista_hoy[-1]
+            ok_8, ok_cond, texto_cond = evaluar_regimen(regimen_elegido, ultima_muestra)
+            if ok_8 and ok_cond:
+                st.success(f"En ventana óptima: {texto_cond}")
+            elif ok_8:
+                st.warning(f"8/8 PIDs válidos, pero fuera de rango del régimen: {texto_cond}")
+            else:
+                st.error(f"Trama incompleta: {texto_cond}")
+
+    with col_reg_ctrl:
+        st.caption(REGIMENES_IFAC[regimen_elegido]["descripcion"])
+
+        b1, b2, b3 = st.columns(3)
+
+        with b1:
+            if not captura_activa:
+                if st.button(
+                    "▶️ Grabar 30",
+                    use_container_width=True,
+                    type="primary",
+                    key="btn_iniciar_ifac"
+                ):
+                    recolector.iniciar_captura_regimen(
+                        regimen_elegido,
+                        validar_fisica=validar_check
+                    )
+                    st.rerun()
+            else:
+                if st.button(
+                    "⏹️ Detener",
+                    use_container_width=True,
+                    key="btn_detener_ifac"
+                ):
+                    recolector.detener_captura()
+                    st.rerun()
+
+        with b2:
+            if st.button(
+                "🗑️ Reiniciar régimen",
+                use_container_width=True,
+                disabled=captura_activa,
+                key="btn_limpiar_ifac"
+            ):
+                recolector.limpiar_regimen(regimen_elegido)
+                st.rerun()
+
+        with b3:
+            df_ifac = recolector.obtener_muestras_ifac()
+            st.download_button(
+                f"📥 CSV ({len(df_ifac)}/90)",
+                data=exportar_csv_ifac(df_ifac),
+                file_name="mazda_bt50_90_muestras_ifac2027.csv",
+                mime="text/csv",
+                disabled=df_ifac.empty,
+                use_container_width=True,
+                key="btn_descargar_90_ifac"
+            )
+
+        if captura_activa:
+            st.info(f"🔴 {estado_captura_msg}")
+        else:
+            st.caption(f"Estado: {estado_captura_msg}")
+
+    # --------------------------------------------------------
+    # Selección de fecha e historial general
+    # --------------------------------------------------------
+
+    st.divider()
+    st.subheader("📅 Historial continuo y selección de jornada")
+
+    if st.session_state.fecha_seleccionada not in fechas:
+        st.session_state.fecha_seleccionada = fecha_hoy
+
+    fecha_elegida = st.selectbox(
+        "Seleccionar fecha:",
+        options=fechas,
+        index=fechas.index(st.session_state.fecha_seleccionada),
+        format_func=lambda f: (
+            f"{f} — {conteos.get(f, 0):,} registros"
+        ),
+        key="fecha_obd_selector"
+    )
+
+    st.session_state.fecha_seleccionada = fecha_elegida
+
+    es_hoy = fecha_elegida == fecha_hoy
+
+    if es_hoy:
+        df = pd.DataFrame(lista_hoy)
+    else:
+        df = cargar_dia(
+            fecha_elegida,
+            conteos.get(fecha_elegida, 0)
+        )
+
+    total_dia = len(df)
+
+    # --------------------------------------------------------
+    # Exportación CSV continuo
+    # --------------------------------------------------------
+
+    if not df.empty:
+
+        col_csv1, col_csv2 = st.columns(2)
+
+        with col_csv1:
+
+            st.download_button(
+                "📅 Descargar jornada continua seleccionada",
+                data=exportar_csv(df),
+                file_name=f"mazda_bt50_obd2_{fecha_elegida}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="btn_csv_jornada"
+            )
+
+        with col_csv2:
+
+            st.download_button(
+                "🌐 Descargar historial continuo completo",
+                data=exportar_csv(
+                    recolector.obtener_lecturas_fecha(None)
+                ),
+                file_name="mazda_bt50_obd2_completo.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="btn_csv_completo"
+            )
+
+        st.caption(
+            f"Registros continuos de la jornada: {total_dia:,} | "
+            f"Registros históricos totales: {total_global:,}"
+        )
+
+    else:
+
+        st.info("Todavía no existen registros continuos para esta fecha.")
 
     # --------------------------------------------------------
     # Últimas lecturas (8 KPIs en 2 filas de 4 columnas)
@@ -1123,7 +1527,7 @@ def dashboard():
 
     st.divider()
 
-    st.subheader("📊 Parámetros del motor (8 PIDs depurados)")
+    st.subheader("📊 Parámetros del motor en vivo (8 PIDs depurados)")
 
     if df.empty:
 
